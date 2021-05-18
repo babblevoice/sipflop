@@ -19,7 +19,9 @@ conf = json.load( open( "config.json" ) )
 
 
 # regexes for pulling out info
-retotag = re.compile( r"^To: (.*)?tag=([a-zA-Z0-9\-]*)?.*$", re.MULTILINE | re.IGNORECASE )
+retotag = re.compile( r"^To: <(.*)>;?tag=([a-zA-Z0-9\-]*)?.*$", re.MULTILINE | re.IGNORECASE )
+refromtag = re.compile( r"^From: <(.*)>;?tag=([a-zA-Z0-9\-]*)?.*$", re.MULTILINE | re.IGNORECASE )
+cseqsearch = re.compile( r"^CSeq: ([a-zA-Z0-9\-]*)? (INVITE|ACK|BYE|CANCEL|OPTIONS|MESSAGE|REFER|UPDATE|NOTIFY)", re.MULTILINE | re.IGNORECASE )
 proxyauthrealmauth = re.compile( r'^Proxy-Authenticate: Digest(.*)?realm="([a-zA-Z0-9\.]*)?",(.*)?', re.MULTILINE | re.IGNORECASE )
 proxyauthnonce = re.compile( r'^Proxy-Authenticate: Digest(.*)?nonce="([a-zA-Z0-9\.\-]*)?",(.*)?', re.MULTILINE | re.IGNORECASE )
 qopcheck = re.compile( r'^Proxy-Authenticate: Digest(.*)?qop="(auth)",?(.*)?', re.MULTILINE | re.IGNORECASE )
@@ -28,8 +30,9 @@ contentlengthsearch = re.compile( r'^Content-Length: (\d{0,10})?', re.MULTILINE 
 sdpaudioportsearch = re.compile( r'^m=audio (\d{1,5})?.*?$', re.MULTILINE | re.IGNORECASE )
 sdpaudioipsearch = re.compile( r'^c=IN IP4 (.*)?$', re.MULTILINE | re.IGNORECASE )
 sdpsessionsearch = re.compile( r'^o=(\w*)? (\w*)? (.*)?$', re.MULTILINE | re.IGNORECASE )
-sipactionsearch = re.compile( r'^(INVITE|ACK|BYE|CANCEL|OPTIONS|MESSAGE|REFER|UPDATE|NOTIFY) (.*)? SIP\/2.0$', re.MULTILINE | re.IGNORECASE )
-
+sipactionsearch = re.compile( r'^(INVITE|ACK|BYE|CANCEL|OPTIONS|MESSAGE|REFER|UPDATE|NOTIFY) (.*)? SIP\/2.0', re.MULTILINE | re.IGNORECASE )
+contactsearch = re.compile( r'^Contact: <(.*)?>', re.MULTILINE | re.IGNORECASE )
+viaheader = re.compile( r'^Via: (.*)?\r\n', re.MULTILINE | re.IGNORECASE )
 
 def getlocalip():
   s = socket.socket( socket.AF_INET, socket.SOCK_DGRAM )
@@ -92,6 +95,7 @@ def newcall( c, target ):
     "secret": conf[ "sip" ][ "secret" ],
     "port": conf[ "sip" ][ "port" ],
     "callid": str( uuid.uuid4() ),
+    "history": [],
     "tags": {
       "ours": str( uuid.uuid4() )[ :8 ],
       "theirs": ""
@@ -152,8 +156,11 @@ def addauthheader( h, method, uri, s ):
 
 def sendinvite( s, auth=False, rtpport=10000 ):
 
-  s[ "sdp" ] = '''v=0
-o=Z 1620481633724 1 IN IP4 {localip}
+  s[ "sdpsessversion" ] = 1
+  s[ "rtpport" ] = rtpport
+
+  s[ "sdptemplate" ] = '''v=0
+o=Z 1620481633724 {sessversion} IN IP4 {localip}
 s=Z
 c=IN IP4 {localip}
 t=0 0
@@ -161,7 +168,12 @@ m=audio {rtpport} RTP/AVP 8 101
 a=rtpmap:101 telephone-event/8000
 a=fmtp:101 0-16
 a=sendrecv
-'''.format( localip=localip, rtpport=rtpport ).replace( "\n", "\r\n" )
+'''.replace( "\n", "\r\n" )
+
+  s[ "sdp" ] = s[ "sdptemplate" ].format(
+                            localip=localip,
+                            rtpport=s[ "rtpport" ],
+                            sessversion = s[ "sdpsessversion" ] )
 
   s[ "uri" ] = "sip:{target}@{realm};transport=UDP".format( target=s[ "target" ], realm=s[ "realm" ] )
 
@@ -249,51 +261,98 @@ Content-Length: 0
 
   sendto( s, sipbye )
 
-def handleinvite( s, p, uri ):
-  print( "received INVITE" )
-  pass
+def send200( s, method="INVITE" ):
 
+  sip200 = '''SIP/2.0 200 OK
+Via: {via}
+Require: timer
+Contact: <{contact}>
+To: <{touri}>;tag={theirtag}
+From: <{fromuri}>;tag={ourtag}
+Call-ID: {callid}
+CSeq: {cseq} {method}
+Session-Expires: 120;refresher=uac
+Min-SE: 120
+Allow: INVITE, ACK, CANCEL, BYE, NOTIFY, REFER, MESSAGE, OPTIONS, INFO, SUBSCRIBE
+Content-Type: application/sdp
+User-Agent: sipflop
+Allow-Events: presence, kpml, talk
+Content-Length: {sdplength}
+'''.format( uri=s[ "uri" ],
+            localport=s[ "localport" ],
+            localip=localip,
+            contact=s[ "uri" ],
+            target=s[ "target" ],
+            realm=s[ "realm" ],
+            ourtag=s[ "tags" ][ "ours" ],
+            theirtag=s[ "tags" ][ "theirs" ],
+            cseq=s[ "cseq" ],
+            callid=s[ "callid" ],
+            sdplength=len( s[ "sdp" ] ),
+            method=method,
+            fromuri=s[ "fromuri" ],
+            touri=s[ "touri" ],
+            via=s[ "via" ]
+          )
 
-def waitfor( s, code ):
-  for x in [ 0, 1, 2 ]:
-    p = recv( s )
+  # sdp in s[ "sdp" ]
+  s[ "sdpsessversion" ] = s[ "sdpsessversion" ] + 1
+  s[ "sdp" ] = s[ "sdptemplate" ].format(
+                      localip=localip,
+                      rtpport=s[ "rtpport" ],
+                      sessversion=s[ "sdpsessversion" ] )
 
-    recevivedcode = codesearch.search( p )
+  print( "Sending: " + sip200 )
+  sendto( s, sip200, s[ "sdp" ] )
 
-    if None == recevivedcode:
-      # re-invite?
-      action = sipactionsearch.search( p )
-      if None != action:
-        method = action.group( 1 )
-        uri = action.group( 2 )
+def wait( s ):
 
-        if "INVITE" == method:
-          handleinvite( s, p, uri )
+  p = recv( s )
+  s[ "history" ].append( p )
 
-      continue
+  recevivedcode = codesearch.search( p )
 
-    recevivedcode = int( recevivedcode.group( 1 ) )
-    assert recevivedcode == code, "We didn't receive the correct response expecting {code} but got {p}".format( p=p, code=code )
+  if None == recevivedcode:
+    # re-invite?
+    action = sipactionsearch.search( p )
+    if None == action:
+      print( "Couldn't find code or method in: " + p )
+      return None
 
-    if 401 == recevivedcode or 407 == recevivedcode:
-      try:
-        s[ "tags" ][ "theirs" ] = retotag.search( p ).group( 2 ).strip()
-        s[ "auth" ][ "realm" ] = proxyauthrealmauth.search( p ).group( 2 ).strip()
-        s[ "auth" ][ "nonce" ] = proxyauthnonce.search( p ).group( 2 ).strip()
-        s[ "auth" ][ "qop" ] = qopcheck.search( p ).group( 2 ).strip()
-        s[ "auth" ][ "nc" ] = 1
-      except:
-        print( "Bad things happend whilst parsing packet: " + p )
-        print( s )
+    method = action.group( 1 )
+    tosearchres = retotag.search( p )
+    fromsearchres = refromtag.search( p )
+    if "INVITE" == method:
+      s[ "tags" ][ "theirs" ] = tosearchres.group( 2 ).strip()
+      s[ "tags" ][ "ours" ] = fromsearchres.group( 2 ).strip()
+      s[ "touri" ] = tosearchres.group( 1 ).strip()
+      s[ "fromuri" ] = fromsearchres.group( 1 ).strip()
+      s[ "cseq" ] = int( cseqsearch.search( p ).group( 1 ).strip() )
+      s[ "uri" ] = action.group( 2 )
+      s[ "via" ] = viaheader.search( p ).group( 1 ).strip()
 
-    elif 200 == recevivedcode:
+    return method
+
+  recevivedcode = int( recevivedcode.group( 1 ) )
+  if 401 == recevivedcode or 407 == recevivedcode:
+    try:
       s[ "tags" ][ "theirs" ] = retotag.search( p ).group( 2 ).strip()
+      s[ "auth" ][ "realm" ] = proxyauthrealmauth.search( p ).group( 2 ).strip()
+      s[ "auth" ][ "nonce" ] = proxyauthnonce.search( p ).group( 2 ).strip()
+      s[ "auth" ][ "qop" ] = qopcheck.search( p ).group( 2 ).strip()
+      s[ "auth" ][ "nc" ] = 1
+    except:
+      print( "Bad things happend whilst parsing packet: " + p )
+      print( s )
 
-      cs = contentlengthsearch.search( p )
-      if None != cs and  int( cs.group( 1 ) ) > 0:
-        s[ "body" ] = p[ p.find( "\r\n\r\n" ): ]
+  elif 200 == recevivedcode:
+    s[ "tags" ][ "theirs" ] = retotag.search( p ).group( 2 ).strip()
 
-    return True
+    cs = contentlengthsearch.search( p )
+    if None != cs and  int( cs.group( 1 ) ) > 0:
+      s[ "body" ] = p[ p.find( "\r\n\r\n" ): ]
+
+  return recevivedcode
 
 # Return host, port, session
 def getremoteaudiohostport( s ):

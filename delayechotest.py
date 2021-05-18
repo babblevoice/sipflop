@@ -24,10 +24,9 @@ stalltimesec = 5
 Our functions for sending and receiving RTP Data
 '''
 ################################################################################
-def roundtriptimesender( shared, sock, remotehost, remoteport, duration, ssrc ):
+def roundtriptimesender( shared, sock, remotehost, remoteport, ssrc ):
 
   starttime = time.perf_counter()
-  endtime = starttime + duration
   nexttime = starttime + 0.02
 
   sequencenumber = 0
@@ -35,7 +34,7 @@ def roundtriptimesender( shared, sock, remotehost, remoteport, duration, ssrc ):
 
   indexlastsent = 0
 
-  while nexttime < endtime:
+  while True == shared[ "running" ]:
 
     # Stall
     if shared[ "stalltimesec" ] > 0 and sequencenumber in stallatsequencenumber:
@@ -64,14 +63,11 @@ def roundtriptimesender( shared, sock, remotehost, remoteport, duration, ssrc ):
     sock.sendto( pk, ( remotehost, remoteport ) )
 
     # Sleep half the time then sit on a hi res clock
-    time.sleep( 0.01 )
+    time.sleep( 0.015 )
     while time.perf_counter() < nexttime:
       pass
 
     nexttime = nexttime + 0.02
-
-  with  shared[ "threadlock" ]:
-    shared[ "running" ] = False
 
   print( "Sent " + str( sequencenumber ) + " packets" )
 
@@ -79,6 +75,9 @@ def roundtriptimerecevier( shared, sock ):
 
   running = True
   receivedcount = 0
+
+  starttime = time.time()
+
   while running:
     pk, address = sock.recvfrom( 1500 )
     receivedcount = receivedcount + 1
@@ -88,12 +87,16 @@ def roundtriptimerecevier( shared, sock ):
 
       if pk[ 15 ] == shared[ "indexlookingfor" ]:
         # End the timer
-        print( "time taken:" + str( time.perf_counter() - shared[ "timer" ] ) )
+        nowtime = time.time()
+        elapsedmin = int( ( nowtime - starttime ) / 60 )
+        elapsedsec = int( ( nowtime - starttime ) % 60 )
+
+        print( "elapsed: {elapsedmin}:{elapsedsec} time taken: {timetaken}".format( elapsedmin=elapsedmin, elapsedsec=elapsedsec, timetaken=str( time.perf_counter() - shared[ "timer" ] ) ) )
         shared[ "indexlookingfor" ] = ( shared[ "indexlookingfor" ] + 1 ) % 10
 
   print( "Received " + str( receivedcount ) + " packets" )
 
-def roundtriptime( localport, remotehost, remoteport, ssrc, duration=60 ):
+def roundtriptime( localport, remotehost, remoteport, ssrc ):
 
   shared = {
     "indexlookingfor": 1,
@@ -108,14 +111,20 @@ def roundtriptime( localport, remotehost, remoteport, ssrc, duration=60 ):
   sock.setsockopt( socket.IPPROTO_IP, socket.IP_TOS, 184 ) # EF ( DSCP=46, ECN=0 )
   sock.bind( ( "", localport ) )
 
-  sender = threading.Thread( target=roundtriptimesender, args=( shared, sock, remotehost, remoteport, duration, ssrc ) )
-  receiver = threading.Thread( target=roundtriptimerecevier, args=( shared, sock, ) )
+  shared[ "sender" ] = threading.Thread( target=roundtriptimesender, args=( shared, sock, remotehost, remoteport, ssrc ) )
+  shared[ "receiver" ] = threading.Thread( target=roundtriptimerecevier, args=( shared, sock, ) )
 
-  sender.start()
-  receiver.start()
+  shared[ "sender" ].start()
+  shared[ "receiver" ].start()
 
-  sender.join()
-  receiver.join()
+  return shared
+
+def finishroundtriptime( shared ):
+
+  shared[ "running" ] = False
+
+  shared[ "receiver" ].join()
+  shared[ "receiver" ].join()
 
 
 ################################################################################
@@ -129,21 +138,29 @@ s = sip.newcall( c, echotarget )
 
 sip.trace( s )
 sip.sendinvite( s )
-sip.waitfor( s, 407 )
+assert 407 == sip.wait( s )
 sip.sendack( s )
 
 sip.sendinvite( s, rtpport=localrtpport, auth=True )
-sip.waitfor( s, 100 )
-sip.waitfor( s, 200 )
+assert 100 == sip.wait( s )
+assert 200 == sip.wait( s )
 sip.sendack( s )
 
 remotehost, remotertpport, session = sip.getremoteaudiohostport( s )
 
 print( "Remote session: " + remotehost + ":" + str( remotertpport ) + ", " + str( session ) )
-roundtriptime( localrtpport, remotehost, remotertpport, session, duration=60 )
+roundtriptime( localrtpport, remotehost, remotertpport, session )
 
+# Handle session timers
+for i in range( 100 ):
+  if "INVITE" == sip.wait( s ):
+    print( "INVITE" )
+    sip.send200( s )
+    assert "ACK" == sip.wait( s )
+
+# Now hangup the call
 sip.sendbye( s )
-sip.waitfor( s, 200 )
+assert 200 == sip.wait( s )
 
 sip.closetrace( s )
 
