@@ -1,0 +1,12 @@
+{
+  "sip": {
+    "host": "some.host.com",
+    "port": 5060,
+    "realm": "some.realm.com",
+    "user": "1000",
+    "secret": "somesecret"
+  },
+  "rtp": {
+
+  }
+}
