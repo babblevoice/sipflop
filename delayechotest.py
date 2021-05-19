@@ -12,11 +12,12 @@ import threading
 import socket
 from sflib import sip
 from sflib import rtp
+import random
 
 echotarget = "8"
-localrtpport = 10000
-stallatsequencenumber = [ 10, 200, 800, 1600 ]
-stalltimesec = 5
+localrtpport = int ( random.randrange( 20000, 30000 ) / 2 ) * 2
+stallatsequencenumber = []
+stalltimesec = 1
 
 
 ################################################################################
