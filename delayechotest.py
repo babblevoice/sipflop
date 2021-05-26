@@ -14,6 +14,16 @@ from sflib import sip
 from sflib import rtp
 import random
 
+import argparse
+parser = argparse.ArgumentParser()
+
+parser.add_argument( "-d", "--duration", required=True )
+args = parser.parse_args()
+
+duration = int( args.duration )
+now = int( time.time() )
+finish = now + duration
+
 echotarget = "8"
 localrtpport = int ( random.randrange( 20000, 30000 ) / 2 ) * 2
 stallatsequencenumber = []
@@ -139,29 +149,35 @@ s = sip.newcall( c, echotarget )
 
 sip.trace( s )
 sip.sendinvite( s )
-assert 407 == sip.wait( s )
+assert 407 == sip.wait( s, retrysend=3, require=407 ) # we might receive 100 first
 sip.sendack( s )
 
 sip.sendinvite( s, rtpport=localrtpport, auth=True )
-assert 100 == sip.wait( s )
-assert 200 == sip.wait( s )
+assert 100 == sip.wait( s, retrysend=3 )
+assert 200 == sip.wait( s, retrysend=3, require=200 ) # we might receive a 180
 sip.sendack( s )
 
 remotehost, remotertpport, session = sip.getremoteaudiohostport( s )
 
 print( "Remote session: " + remotehost + ":" + str( remotertpport ) + ", " + str( session ) )
-roundtriptime( localrtpport, remotehost, remotertpport, session )
+rtt = roundtriptime( localrtpport, remotehost, remotertpport, session )
 
 # Handle session timers
 for i in range( 100 ):
-  if "INVITE" == sip.wait( s ):
+  if "INVITE" == sip.wait( s, timeout=duration ):
     print( "INVITE" )
     sip.send200( s )
-    assert "ACK" == sip.wait( s )
+    assert "ACK" == sip.wait( s, retrysend=3, require="ACK" )
+
+  duration = finish - int( time.time() )
+  if duration < 0:
+    break
+
+rtt[ "running" ] = False
 
 # Now hangup the call
 sip.sendbye( s )
-assert 200 == sip.wait( s )
+assert 200 == sip.wait( s, retrysend=3, require=200 )
 
 sip.closetrace( s )
 
