@@ -1,9 +1,12 @@
 
+# We require
+# pip install sdp-transform
 
 import json
 import uuid
 
 import socket
+import select
 import random
 
 import re
@@ -15,6 +18,8 @@ import hashlib
 import tempfile
 from datetime import datetime
 
+import sdp_transform
+
 conf = json.load( open( "config.json" ) )
 
 
@@ -23,9 +28,9 @@ retotag = re.compile( r"^To: <(.*)>;?tag=([a-zA-Z0-9\-]*)?.*$", re.MULTILINE | r
 refromtag = re.compile( r"^From: <(.*)>;?tag=([a-zA-Z0-9\-]*)?.*$", re.MULTILINE | re.IGNORECASE )
 cseqsearch = re.compile( r"^CSeq: ([a-zA-Z0-9\-]*)? (INVITE|ACK|BYE|CANCEL|OPTIONS|MESSAGE|REFER|UPDATE|NOTIFY)", re.MULTILINE | re.IGNORECASE )
 proxyauthrealmauth = re.compile( r'^Proxy-Authenticate: Digest(.*)?realm="([a-zA-Z0-9\.]*)?",(.*)?', re.MULTILINE | re.IGNORECASE )
-proxyauthnonce = re.compile( r'^Proxy-Authenticate: Digest(.*)?nonce="([a-zA-Z0-9\.\-]*)?",(.*)?', re.MULTILINE | re.IGNORECASE )
+proxyauthnonce = re.compile( r'^Proxy-Authenticate: Digest(.*)?nonce="([a-zA-Z0-9\.\-]*)?"(.*)?', re.MULTILINE | re.IGNORECASE )
 qopcheck = re.compile( r'^Proxy-Authenticate: Digest(.*)?qop="(auth)",?(.*)?', re.MULTILINE | re.IGNORECASE )
-codesearch = re.compile( r'^SIP/2.0 (\d\d\d) .*$', re.MULTILINE | re.IGNORECASE )
+codesearch = re.compile( r'^SIP\/2.0 (\d\d\d) .*$', re.MULTILINE | re.IGNORECASE )
 contentlengthsearch = re.compile( r'^Content-Length: (\d{0,10})?', re.MULTILINE | re.IGNORECASE )
 sdpaudioportsearch = re.compile( r'^m=audio (\d{1,5})?.*?$', re.MULTILINE | re.IGNORECASE )
 sdpaudioipsearch = re.compile( r'^c=IN IP4 (.*)?$', re.MULTILINE | re.IGNORECASE )
@@ -46,6 +51,7 @@ def client():
   sock = socket.socket( socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_UDP )
   sock.setsockopt( socket.SOL_SOCKET, socket.SO_REUSEADDR, 1 )
   sock.bind( ( "", random.randrange( 1024, 9999 ) ) )
+  sock.setblocking( 0 )
 
   return sock
 
@@ -61,27 +67,45 @@ def closetrace( s ):
 # h = headers (SIP headers)
 # b = body (SDP)
 def sendto( s, h, b=None ):
-  msg = h + "\r\n"
-  if None != b and len( b ) > 0:
-    msg += b
 
-  msg = msg.replace( "\r\n", "\n" ).replace( "\n", "\r\n" )
+  if None != h:
+    msg = h + "\r\n"
+    if None != b and len( b ) > 0:
+      msg += b
 
-  s[ "sock" ].sendto( bytearray( msg, "utf-8" ), ( s[ "host" ], s[ "port" ] ) )
+    msg = msg.replace( "\r\n", "\n" ).replace( "\n", "\r\n" )
 
-  if "tracefile" in s:
-    s[ "tracefile" ].write( "==================================================\r\n{time} Sending {bytes} bytes:\r\n==================================================\r\n".format( time=str( datetime.now() ), bytes=len( msg ) ) )
-    s[ "tracefile" ].write( msg )
+    s[ "lastsent" ] = msg
 
-def recv( s ):
-  data, addr = s[ "sock" ].recvfrom( 1500 )
-  msg = data.decode()
+  s[ "sock" ].sendto( bytearray( s[ "lastsent" ], "utf-8" ), ( s[ "host" ], s[ "port" ] ) )
 
   if "tracefile" in s:
-    s[ "tracefile" ].write( "==================================================\r\n{time} Received {bytes} bytes:\r\n==================================================\r\n".format( time=str( datetime.now() ), bytes=len( msg ) ) )
-    s[ "tracefile" ].write( msg )
+    s[ "tracefile" ].write( "==================================================\r\n{time} Sending {bytes} bytes:\r\n==================================================\r\n".format( time=str( datetime.now() ), bytes=len( s[ "lastsent" ] ) ) )
+    s[ "tracefile" ].write( s[ "lastsent" ] )
+    s[ "tracefile" ].flush()
 
-  return msg
+def resend( s ):
+  sendto( s, None )
+
+def recv( s, timeout=0.5 ):
+  ready = select.select( [ s[ "sock" ] ], [], [], timeout )
+  if ready[ 0 ]:
+
+    data, addr = s[ "sock" ].recvfrom( 1500 )
+    msg = data.decode()
+
+    if "tracefile" in s:
+      s[ "tracefile" ].write( "==================================================\r\n{time} Received {bytes} bytes:\r\n==================================================\r\n".format( time=str( datetime.now() ), bytes=len( msg ) ) )
+      s[ "tracefile" ].write( msg )
+      s[ "tracefile" ].flush()
+
+    return msg
+
+  else:
+    # Timeout
+    pass
+
+  return False
 
 def newcall( c, target ):
   return {
@@ -95,7 +119,6 @@ def newcall( c, target ):
     "secret": conf[ "sip" ][ "secret" ],
     "port": conf[ "sip" ][ "port" ],
     "callid": str( uuid.uuid4() ),
-    "history": [],
     "tags": {
       "ours": str( uuid.uuid4() )[ :8 ],
       "theirs": ""
@@ -265,14 +288,11 @@ def send200( s, method="INVITE" ):
 
   sip200 = '''SIP/2.0 200 OK
 Via: {via}
-Require: timer
 Contact: <{contact}>
 To: <{touri}>;tag={theirtag}
 From: <{fromuri}>;tag={ourtag}
 Call-ID: {callid}
 CSeq: {cseq} {method}
-Session-Expires: 120;refresher=uac
-Min-SE: 120
 Allow: INVITE, ACK, CANCEL, BYE, NOTIFY, REFER, MESSAGE, OPTIONS, INFO, SUBSCRIBE
 Content-Type: application/sdp
 User-Agent: sipflop
@@ -302,13 +322,17 @@ Content-Length: {sdplength}
                       rtpport=s[ "rtpport" ],
                       sessversion=s[ "sdpsessversion" ] )
 
-  print( "Sending: " + sip200 )
   sendto( s, sip200, s[ "sdp" ] )
 
-def wait( s ):
+def wait( s, require=None, retrysend=0, timeout=0.5 ):
 
-  p = recv( s )
-  s[ "history" ].append( p )
+  p = recv( s, timeout )
+
+  if False == p: # Timeout
+    if 0 != retrysend:
+      resend( s )
+      return wait( s, retrysend=retrysend - 1 )
+    return None
 
   recevivedcode = codesearch.search( p )
 
@@ -320,6 +344,10 @@ def wait( s ):
       return None
 
     method = action.group( 1 )
+
+    if None != require and method != require:
+      return wait( s, retrysend=retrysend, require=require, timeout=timeout )
+
     tosearchres = retotag.search( p )
     fromsearchres = refromtag.search( p )
     if "INVITE" == method:
@@ -334,13 +362,18 @@ def wait( s ):
     return method
 
   recevivedcode = int( recevivedcode.group( 1 ) )
+
+  if None != require and recevivedcode != require:
+    return wait( s, retrysend=retrysend, require=require, timeout=timeout )
+
   if 401 == recevivedcode or 407 == recevivedcode:
     try:
+      s[ "auth" ][ "nc" ] = 1
       s[ "tags" ][ "theirs" ] = retotag.search( p ).group( 2 ).strip()
       s[ "auth" ][ "realm" ] = proxyauthrealmauth.search( p ).group( 2 ).strip()
       s[ "auth" ][ "nonce" ] = proxyauthnonce.search( p ).group( 2 ).strip()
       s[ "auth" ][ "qop" ] = qopcheck.search( p ).group( 2 ).strip()
-      s[ "auth" ][ "nc" ] = 1
+
     except:
       print( "Bad things happend whilst parsing packet: " + p )
       print( s )
@@ -351,12 +384,13 @@ def wait( s ):
     cs = contentlengthsearch.search( p )
     if None != cs and  int( cs.group( 1 ) ) > 0:
       s[ "body" ] = p[ p.find( "\r\n\r\n" ): ]
+      s[ "sdp" ] = sdp_transform.parse( s[ "body" ] )
 
   return recevivedcode
 
 # Return host, port, session
 def getremoteaudiohostport( s ):
 
-  return ( sdpaudioipsearch.search( s[ "body" ] ).group( 1 ).strip(),
-          int( sdpaudioportsearch.search( s[ "body" ] ).group( 1 ).strip() ),
-          int( sdpsessionsearch.search( s[ "body" ] ).group( 2 ).strip() ) )
+  return ( s[ "sdp" ][ "connection" ][ "ip" ],
+          int( s[ "sdp" ][ "media" ][ 0 ][ "port" ] ),
+          int( s[ "sdp" ][ "origin" ][ "sessionId" ] ) )
